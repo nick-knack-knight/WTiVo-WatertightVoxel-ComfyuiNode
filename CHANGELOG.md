@@ -2,6 +2,20 @@
 
 All notable changes to the WTiVo (WatertightVoxel Optimizer) ComfyUI node will be documented in this file.
 
+## [Unreleased] - Ubuntu fork
+
+### Changed
+- Linux/Ubuntu 24.04 (Python 3.12, torch 2.8.0+cu128, sm_86) support. The backend (`wtivo.py` + native extensions) is no longer vendored: `scripts/install_linux.sh` clones and builds it into `backend/`, or unpacks a prebuilt tarball.
+- `inprocess.py` resolves the backend via `wtivo_env.py` (`WTIVO_HOME`, `WTIVO_BUILD_DIR`, `WTIVO_PYTHON`), reports setup problems with a fix hint and includes the last worker output on failure.
+- The worker runs in its own process group; the ComfyUI Cancel button now terminates it. Progress bar follows worker stages.
+- New optional `unload_models` input (default on) frees ComfyUI models/VRAM before the run.
+
+### Removed
+- Windows binaries (`.pyd`, DLLs, `.rar`), the Windows `CMakeLists.txt`, the node-local `wtivo.py`, and committed `__pycache__`.
+
+### Added
+- `tests/test_worker_bridge.py` (fake-backend tests for the npy bridge, failure reporting, cancel and setup errors).
+
 ## [1.2.0] - 2026-09-19
 
 ### 🚨 Critical Fixes

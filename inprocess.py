@@ -1,16 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Run the WTiVo backend in an isolated worker process and exchange meshes as .npy files.
+
+The native CGAL/OpenVDB code is memory hungry and fragments the heap, so every job runs in
+a fresh process that exits when the mesh is done.  This module deliberately imports neither
+torch nor ComfyUI so it can be tested stand-alone; the node passes in the ComfyUI hooks.
+"""
+
 from __future__ import annotations
+
 import logging
 import os
+import queue
+import re
+import signal
 import subprocess
-import sys
 import tempfile
+import threading
 import time
+from collections import deque
+from typing import Callable, Optional
+
 import numpy as np
 
+from .wtivo_env import resolve, worker_env
+
 # Stable internals. These are intentionally not ComfyUI widgets.
-GPU_LOCAL_STEPS = 8
-GLOBAL_RELABEL_PERIOD = 1024
-MAX_ROUNDS = 2_000_000
 THICK_BAND_VOXELS = 3.0
 THIN_BAND_VOXELS = 3.0
 FAITHC_TRI_MODE = "auto"
@@ -18,12 +32,42 @@ FAITHC_CLAMP_ANCHORS = True
 FAITHC_LAMBDA_N = 1.0
 FAITHC_LAMBDA_D = 0.1
 
+# (substring of a worker log line, progress percent when it is seen)
+_STAGES = (
+    ("[WTiVo-PointBudget] input", 3),
+    ("[WTiVo-PointBudget] CGAL proxy points", 25),
+    ("Tetrahedralizing", 28),
+    ("[WTiVo-Timing] tetrahedralize", 45),
+    ("Graph cutting", 48),
+    ("[WTiVo-Timing] graph_cut", 70),
+    ("[WTiVo-Timing] surface extraction", 78),
+    ("[FINAL] v/f", 95),
+    ("[DONE]", 100),
+)
+_FINAL_RE = re.compile(r"\[FINAL\] watertight=(\w+) \| bad_edge_groups=(\d+)")
+
+
+def _kill(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        process.wait()
+
+
 def process_arrays(
     vertices,
     faces,
     *,
     input_res: int = 1536,
-    final_res: int = 1024,
+    final_res: int = 1536,
     proxy_points: int = 12_000_000,
     proxy_eps_scale: float = 1.0,
     proxy_feature_weight: float = 1.5,
@@ -31,8 +75,14 @@ def process_arrays(
     threads: int = 16,
     thin_iso_vox: float = 0.0,
     faithc_component_mode: str = "auto",
+    progress: Optional[Callable[[int], None]] = None,
+    check_interrupt: Optional[Callable[[], None]] = None,
 ):
-    """Run WTiVo in an isolated subprocess and return output arrays + audit info."""
+    """Return (vertices, faces, watertight, bad_edge_groups, seconds).
+
+    ``progress(percent)`` is called as worker stages complete.  ``check_interrupt()`` is called
+    about 4x/second and should raise to cancel; the worker process group is then killed.
+    """
     if faithc_component_mode not in ("auto", "keep_all", "largest"):
         raise ValueError("faithc_component_mode must be auto, keep_all, or largest")
     if float(proxy_feature_weight) < 0.0:
@@ -49,29 +99,22 @@ def process_arrays(
     if len(vertices) == 0 or len(faces) == 0:
         raise ValueError("WTiVo received an empty mesh")
 
-    # Create a secure temporary directory for the NPY bridge
-    with tempfile.TemporaryDirectory(prefix="wtivo_") as tmp_dir:
-        v_in_path = os.path.join(tmp_dir, "v_in.npy")
-        f_in_path = os.path.join(tmp_dir, "f_in.npy")
-        v_out_path = os.path.join(tmp_dir, "v_out.npy")
-        f_out_path = os.path.join(tmp_dir, "f_out.npy")
-        
-        # Save input arrays for the subprocess to read
-        np.save(v_in_path, np.ascontiguousarray(vertices, dtype=np.float64))
-        np.save(f_in_path, np.ascontiguousarray(faces, dtype=np.int32))
-        
-        # Locate the standalone wtivo.py script
-        wtivo_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wtivo.py")
-        if not os.path.exists(wtivo_script):
-            raise RuntimeError(f"Could not find wtivo.py at {wtivo_script}")
+    python, script, build = resolve()
 
-        # Build the command line arguments matching wtivo.py's argparse
+    with tempfile.TemporaryDirectory(prefix="wtivo_") as tmp_dir:
+        v_in = os.path.join(tmp_dir, "v_in.npy")
+        f_in = os.path.join(tmp_dir, "f_in.npy")
+        v_out = os.path.join(tmp_dir, "v_out.npy")
+        f_out = os.path.join(tmp_dir, "f_out.npy")
+        np.save(v_in, np.ascontiguousarray(vertices, dtype=np.float64))
+        np.save(f_in, np.ascontiguousarray(faces, dtype=np.int32))
+
         cmd = [
-            sys.executable, wtivo_script,
-            "--input-vertices-npy", v_in_path,
-            "--input-faces-npy", f_in_path,
-            "--output-vertices-npy", v_out_path,
-            "--output-faces-npy", f_out_path,
+            str(python), str(script),
+            "--input-vertices-npy", v_in,
+            "--input-faces-npy", f_in,
+            "--output-vertices-npy", v_out,
+            "--output-faces-npy", f_out,
             "--input-res", str(int(input_res)),
             "--final-res", str(int(final_res)),
             "--proxy_points", str(int(proxy_points)),
@@ -88,69 +131,80 @@ def process_arrays(
             "--faithc_lambda_n", str(FAITHC_LAMBDA_N),
             "--faithc_lambda_d", str(FAITHC_LAMBDA_D),
         ]
-        
-        logging.info("[WTiVo] Spawning isolated subprocess to prevent native memory leaks...")
+
+        logging.info("[WTiVo] Spawning isolated worker: %s", python)
         t_all = time.perf_counter()
-        
-        # Run the subprocess, streaming output to the ComfyUI console in real-time
         process = subprocess.Popen(
             cmd,
-            env={**os.environ, "WTIVO_SUBPROCESS": "1"},
+            env=worker_env(build),
+            cwd=os.path.dirname(str(script)),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,  # own process group so cancel kills CGAL/TBB threads too
         )
-        
-        output_lines = []
+
+        lines: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _reader():
+            try:
+                for line in process.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=_reader, name="wtivo-log", daemon=True).start()
+
+        tail = deque(maxlen=40)
+        watertight, bad_edges = False, 0
+        reached = 0
+        done = False
         try:
-            for line in process.stdout:
-                print(line, end="", flush=True) # Print to ComfyUI console
-                output_lines.append(line)
-        except Exception as e:
-            logging.warning(f"[WTiVo] Warning while reading subprocess stdout: {e}")
-            
-        process.wait()
-        
+            while not done:
+                if check_interrupt is not None:
+                    check_interrupt()
+                try:
+                    line = lines.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    done = True
+                    continue
+                print(line, end="", flush=True)  # stream to the ComfyUI console
+                tail.append(line.rstrip("\n"))
+                m = _FINAL_RE.search(line)
+                if m:
+                    watertight, bad_edges = m.group(1) == "True", int(m.group(2))
+                if progress is not None:
+                    for marker, pct in _STAGES:
+                        if pct > reached and marker in line:
+                            reached = pct
+                            progress(pct)
+            process.wait()
+        except BaseException:
+            _kill(process)
+            raise
+        finally:
+            if process.poll() is None:
+                _kill(process)
+            process.stdout.close()
+
         if process.returncode != 0:
             raise RuntimeError(
-                f"WTiVo subprocess crashed with exit code {process.returncode}. "
-                "Check the console above for C++ or CUDA errors."
+                f"WTiVo worker failed with exit code {process.returncode}.\n"
+                "Last output:\n" + "\n".join(tail)
             )
-            
-        # Parse the final stats from the captured stdout
-        watertight = False
-        bad_edges = 0
-        
-        for line in output_lines:
-            if "[FINAL] watertight=" in line:
-                try:
-                    # Example: [FINAL] watertight=True | bad_edge_groups=0
-                    parts = line.split("|")
-                    wt_str = parts[0].split("=")[1].strip()
-                    watertight = (wt_str == "True")
-                    be_str = parts[1].split("=")[1].strip()
-                    bad_edges = int(be_str)
-                except Exception:
-                    pass
-                    
+        if not os.path.exists(v_out) or not os.path.exists(f_out):
+            raise RuntimeError("WTiVo worker finished but did not write its output .npy files.")
+
+        final_v = np.load(v_out)
+        final_f = np.load(f_out)
         total_time = time.perf_counter() - t_all
-        
-        # Load the results
-        if not os.path.exists(v_out_path) or not os.path.exists(f_out_path):
-            raise RuntimeError("WTiVo subprocess finished but failed to write output NPY files.")
-            
-        final_v = np.load(v_out_path)
-        final_f = np.load(f_out_path)
-        
         logging.info(
-            "[WTiVo] Done: %s vertices / %s faces | watertight=%s | %.2fs (Subprocess)",
-            f"{len(final_v):,}",
-            f"{len(final_f):,}",
-            bool(watertight),
-            total_time,
+            "[WTiVo] Done: %s vertices / %s faces | watertight=%s | %.2fs",
+            f"{len(final_v):,}", f"{len(final_f):,}", watertight, total_time,
         )
-        
-        return final_v, final_f, bool(watertight), int(bad_edges), float(total_time)
+        return final_v, final_f, watertight, bad_edges, total_time

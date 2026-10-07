@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from .inprocess import process_arrays
+from .wtivo_env import WTiVoSetupError, resolve
 
 
 DEFAULT_THREADS = max(1, os.cpu_count() or 1)
@@ -83,6 +84,36 @@ def _mesh_counts(mesh):
         face_count = int(face_counts[0].item())
 
     return vertex_count, face_count
+
+
+class _Hooks:
+    progress = None
+    check_interrupt = None
+
+
+def _comfy_hooks(unload_models: bool) -> _Hooks:
+    """Wire the worker to ComfyUI's progress bar / cancel button / VRAM manager when present."""
+    hooks = _Hooks()
+    try:
+        import comfy.model_management as mm
+        import comfy.utils
+    except ImportError:  # running outside ComfyUI (tests)
+        return hooks
+
+    if unload_models:
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+
+    bar = comfy.utils.ProgressBar(100)
+    last = [0]
+
+    def progress(pct: int):
+        bar.update(pct - last[0])
+        last[0] = pct
+
+    hooks.progress = progress
+    hooks.check_interrupt = mm.throw_exception_if_processing_interrupted
+    return hooks
 
 
 class WTiVoNativeMeshToMesh:
@@ -167,7 +198,16 @@ class WTiVoNativeMeshToMesh:
                     ["auto", "keep_all", "largest"],
                     {"default": "keep_all"},
                 ),
-            }
+            },
+            "optional": {
+                "unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Free ComfyUI's loaded models/VRAM before the worker starts.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MESH",)
@@ -176,7 +216,7 @@ class WTiVoNativeMeshToMesh:
     CATEGORY = "3d/mesh/WTiVo"
     DESCRIPTION = (
         "WTiVo watertight reconstruction for native ComfyUI/Trellis MESH. "
-        "Runs in-process without RAM cleanup."
+        "Runs in an isolated worker process so native memory is released after every run."
     )
 
     def execute(
@@ -191,8 +231,16 @@ class WTiVoNativeMeshToMesh:
         threads: int,
         thin_iso_vox: float,
         faithc_component_mode: str,
+        unload_models: bool = True,
     ):
         mesh_class = type(mesh)
+
+        try:
+            resolve()  # fail fast, before touching the GPU or ComfyUI's loaded models
+        except WTiVoSetupError as exc:
+            raise RuntimeError(f"[WTiVo] {exc}") from exc
+
+        hooks = _comfy_hooks(unload_models)
 
         vertex_count, face_count = _mesh_counts(mesh)
         print(
@@ -211,6 +259,8 @@ class WTiVoNativeMeshToMesh:
             threads=int(threads),
             thin_iso_vox=float(thin_iso_vox),
             faithc_component_mode=str(faithc_component_mode),
+            progress=hooks.progress,
+            check_interrupt=hooks.check_interrupt,
         )
 
         vertices_out = torch.as_tensor(final_v, dtype=torch.float32)
