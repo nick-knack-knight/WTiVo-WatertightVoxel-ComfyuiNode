@@ -97,6 +97,11 @@ class Bridge(unittest.TestCase):
         with self.assertRaisesRegex(wtivo_env.WTiVoSetupError, "install_linux.sh"):
             inprocess.process_arrays(V, F, **KW)
 
+    def test_old_backend_message(self):
+        (self.root / "wtivo.py").write_text("print('v1.0')\n")
+        with self.assertRaisesRegex(wtivo_env.WTiVoSetupError, "too old"):
+            inprocess.process_arrays(V, F, **KW)
+
     def test_missing_extensions_message(self):
         for p in (self.root / "build").iterdir():
             p.unlink()

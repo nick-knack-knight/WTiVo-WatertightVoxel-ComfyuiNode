@@ -32,6 +32,12 @@ scripts/install_linux.sh --python /path/to/ComfyUI/venv/bin/python
 
 The installer checks ComfyUI's Python/torch, installs `requirements.txt`, clones the backend into `./backend`, builds it (OpenVDB, CGAL, `wtivo_core`, `wtivo_vdb`, `wtivo_gpupr` for your GPU's architecture) and runs `verify_install.py --e2e` with ComfyUI's interpreter. Restart ComfyUI afterwards; the node is **3d/mesh/WTiVo → WTiVo - Mesh Watertight**.
 
+Already built the backend elsewhere? Point the installer at it (no rebuild; it symlinks `./backend` to that checkout and runs the verification), or skip the installer and `export WTIVO_HOME=/path/to/WTiVo-WatertightVoxel` before starting ComfyUI:
+
+```bash
+scripts/install_linux.sh --python /path/to/ComfyUI/venv/bin/python --backend-dir /path/to/WTiVo-WatertightVoxel
+```
+
 Installer options: `--skip-apt`, `--cuda-arch 8.6`, `--ref <backend branch/tag/commit>`, `--backend-dir <existing checkout>`, `--no-e2e`.
 
 ### Build once, copy elsewhere

@@ -38,6 +38,11 @@ def resolve():
     script = backend / "wtivo.py"
     if not script.is_file():
         raise WTiVoSetupError(f"WTiVo backend not found at {backend} (missing wtivo.py). {INSTALL_HINT}")
+    if "--input-vertices-npy" not in script.read_text(encoding="utf-8", errors="replace"):
+        raise WTiVoSetupError(
+            f"The backend at {backend} is too old (no .npy bridge). "
+            "Update it: git -C <backend> pull, then rebuild with scripts/setup_ubuntu.sh."
+        )
     build = build_dir(backend)
     missing = [g.split("*")[0] for g in EXT_GLOBS if not list(build.glob(g))]
     if missing:

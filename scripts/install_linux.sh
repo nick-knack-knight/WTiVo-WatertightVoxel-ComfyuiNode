@@ -48,11 +48,23 @@ else
   info "Using existing backend at $BACKEND"
 fi
 
+# The node looks in ./backend (or $WTIVO_HOME); make an out-of-tree checkout discoverable.
+if [[ "$BACKEND" != "$NODE/backend" ]]; then
+  if [[ -e "$NODE/backend" && ! -L "$NODE/backend" ]]; then
+    fail "$NODE/backend already exists and is not a symlink; remove it or export WTIVO_HOME=$BACKEND"
+  fi
+  ln -sfn "$BACKEND" "$NODE/backend"
+  info "Linked $NODE/backend -> $BACKEND"
+fi
+
 if [[ -n "$PREBUILT" ]]; then
   info "Unpacking prebuilt extensions: $PREBUILT"
   mkdir -p "$BACKEND/build"
   tar -xzf "$PREBUILT" -C "$BACKEND/build"
   info "Prebuilt libraries need: sudo apt-get install -y libtbb12 libgmp10 libmpfr6 libboost-iostreams1.83.0"
+elif compgen -G "$BACKEND/build/wtivo_gpupr*.so" >/dev/null && compgen -G "$BACKEND/build/wtivo_core*.so" >/dev/null \
+     && compgen -G "$BACKEND/build/wtivo_vdb*.so" >/dev/null; then
+  info "Compiled extensions already present in $BACKEND/build; skipping build (delete them to force a rebuild)"
 else
   info "Building backend (OpenVDB + CGAL + CUDA extension; this takes a while the first time)"
   "$BACKEND/scripts/setup_ubuntu.sh" "${SETUP_ARGS[@]}"
