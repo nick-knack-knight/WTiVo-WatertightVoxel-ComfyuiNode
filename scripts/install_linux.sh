@@ -7,14 +7,14 @@
 #   --python PATH      interpreter ComfyUI runs with (default: python3 on PATH). It runs the worker.
 #   --prebuilt FILE    unpack a tarball from the backend's scripts/package_build.sh instead of compiling
 #   --backend-dir DIR  use an existing backend checkout instead of cloning into ./backend
-#   --ref REF          backend branch/tag/commit to clone (default: $WTIVO_BACKEND_REF or the Linux branch)
+#   --ref REF          backend branch/tag/commit to clone (default: $WTIVO_BACKEND_REF or main)
 #   --skip-apt         pass through to the backend setup (no apt-get)
 #   --cuda-arch 8.6    pass through to the backend setup (A6000 = 8.6)
 #   --no-e2e           skip the GPU end-to-end verification
 set -euo pipefail
 NODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKEND_URL="${WTIVO_BACKEND_URL:-https://github.com/nick-knack-knight/WTiVo-WatertightVoxel.git}"
-REF="${WTIVO_BACKEND_REF:-claude/exciting-gates-fj81db}"
+REF="${WTIVO_BACKEND_REF:-main}"
 PY="$(command -v python3 || true)"; PREBUILT=""; BACKEND="$NODE/backend"; SETUP_ARGS=(); E2E=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
